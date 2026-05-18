@@ -1,0 +1,16 @@
+# Runtime data (created by snippet-holder)
+.cache/
+.data/
+.config/
+
+# Code index (rebuilt automatically)
+code-index.tsv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~

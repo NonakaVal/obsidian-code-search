@@ -1,0 +1,1084 @@
+#!/bin/bash
+
+# =============================================================================
+# snippet-holder — gerenciador de snippets via Rofi
+# Script único, sem dependências externas além das ferramentas do sistema.
+# =============================================================================
+
+set -euo pipefail
+
+source "$HOME/.local/bin/note_lib.sh"
+
+# -----------------------------------------------------------------------------
+# Configuração — caminhos padrão (sobrescritos pelo arquivo de config)
+# -----------------------------------------------------------------------------
+NOTES_DIR="$HOME/Documentos/Notes/01 Snippets"
+CONFIG_DIR="$NOTES_DIR/.config"
+CONFIG_FILE="$CONFIG_DIR/config"
+DATA_DIR="$NOTES_DIR/.data"
+CACHE_DIR="$NOTES_DIR/.cache"
+
+EDITOR_APP="mousepad"
+DEFAULT_SORT="recent"
+HISTORY_LIMIT="20"
+PREVIEW_LINES="15"
+
+HISTORY_FILE="$DATA_DIR/history"
+FAVORITES_FILE="$DATA_DIR/favorites"
+
+DATE_FORMAT="$(date +%Y-%m-%d)"
+
+# -----------------------------------------------------------------------------
+# Config — carrega e garante estrutura de diretórios
+# -----------------------------------------------------------------------------
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+    mkdir -p "$NOTES_DIR" "$DATA_DIR" "$CACHE_DIR" "$CONFIG_DIR"
+    touch "$HISTORY_FILE" "$FAVORITES_FILE"
+}
+
+write_default_config() {
+    [ -f "$CONFIG_FILE" ] && return
+    cat > "$CONFIG_FILE" <<EOF
+# snippet-holder — configuração
+NOTES_DIR="$NOTES_DIR"
+EDITOR_APP="$EDITOR_APP"
+DEFAULT_SORT="recent"
+HISTORY_LIMIT="40"
+PREVIEW_LINES="5"
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Rofi — wrapper central
+# -----------------------------------------------------------------------------
+ROFI_THEME='
+window   { width: 640px; }
+listview { lines: 9; spacing: 2px; }
+inputbar { padding: 6px 8px; }
+element  { padding: 4px 8px; }
+element-text { font: "JetBrains Mono 10, Monospace 10"; }
+'
+
+rofi_menu() {
+    local extra_args=()
+    [ "$XDG_SESSION_TYPE" = "wayland" ] && extra_args+=("-normal-window")
+    rofi -dmenu -i "${extra_args[@]}" -theme-str "$ROFI_THEME" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# Clipboard
+# -----------------------------------------------------------------------------
+copy_to_clipboard() {
+    if command -v wl-copy >/dev/null 2>&1 && [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+        wl-copy
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard
+    elif command -v wl-copy >/dev/null 2>&1; then
+        wl-copy
+    else
+        notify-send "Trechos" "Instale xclip ou wl-clipboard."
+        return 1
+    fi
+}
+
+read_clipboard() {
+    if command -v wl-paste >/dev/null 2>&1 && [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+        wl-paste 2>/dev/null
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -o -selection clipboard 2>/dev/null
+    elif command -v wl-paste >/dev/null 2>&1; then
+        wl-paste 2>/dev/null
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Histórico e favoritos
+# -----------------------------------------------------------------------------
+add_to_history() {
+    local file="$1"
+    touch "$file"
+    grep -vFx "$file" "$HISTORY_FILE" 2>/dev/null > "$HISTORY_FILE.tmp" || true
+    echo "$file" | cat - "$HISTORY_FILE.tmp" > "$HISTORY_FILE"
+    head -n "$HISTORY_LIMIT" "$HISTORY_FILE" > "$HISTORY_FILE.tmp"
+    mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+}
+
+toggle_favorite() {
+    local file="$1"
+    local name
+    name="$(basename "$file" .md)"
+    if grep -qFx "$file" "$FAVORITES_FILE" 2>/dev/null; then
+        grep -vFx "$file" "$FAVORITES_FILE" > "$FAVORITES_FILE.tmp" || true
+        mv "$FAVORITES_FILE.tmp" "$FAVORITES_FILE"
+        notify-send "Trechos" "\"$name\" removido dos favoritos."
+    else
+        echo "$file" >> "$FAVORITES_FILE"
+        notify-send "Trechos" "\"$name\" adicionado aos favoritos."
+    fi
+}
+
+is_favorite() {
+    grep -qFx "$1" "$FAVORITES_FILE" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Filesystem — helpers
+# -----------------------------------------------------------------------------
+safe_filename() {
+    echo "$1" | sed 's/[\/:*?"<>|]/-/g' | sed 's/[ ]*$//'
+}
+
+short_path() {
+    local dir="$1"
+    [ "$dir" = "$NOTES_DIR" ] && echo "/" || echo "${dir#$NOTES_DIR/}"
+}
+
+# -----------------------------------------------------------------------------
+# Tags — parser compatível com Obsidian (inline, bloco e escalar)
+#
+# Suporta:
+#   tags: [tag1, tag2]      ← inline
+#   tags:                   ← bloco
+#     - tag1
+#     - tag2
+#   tags: tag-unica         ← escalar
+#
+# Opera apenas dentro do frontmatter (entre os delimitadores ---).
+# -----------------------------------------------------------------------------
+get_snippet_tags() {
+    local file="$1"
+    awk '
+        BEGIN { in_front=0; in_tags_block=0 }
+
+        /^---[[:space:]]*$/ {
+            if (!in_front) { in_front=1; next }
+            else { exit }
+        }
+        !in_front { next }
+
+        /^tags:[[:space:]]*/ {
+            in_tags_block=0
+            sub(/^tags:[[:space:]]*/, "")
+
+            if (/^\[/) {
+                gsub(/^\[|\]$/, "")
+                gsub(/,[[:space:]]*/, "\n")
+                gsub(/[[:space:]]+$/, "")
+                if (length > 0) print
+                next
+            }
+            if (length > 0) {
+                gsub(/[[:space:]]+$/, "")
+                print
+                next
+            }
+            in_tags_block=1
+            next
+        }
+
+        in_tags_block && /^[[:space:]]+-[[:space:]]/ {
+            sub(/^[[:space:]]+-[[:space:]]+/, "")
+            gsub(/[[:space:]]+$/, "")
+            if (length > 0) print
+            next
+        }
+
+        in_tags_block && /^[^[:space:]]/ { exit }
+    ' "$file"
+}
+
+# Todas as tags únicas do vault (para o seletor)
+collect_all_tags() {
+    find "$NOTES_DIR" \( -path "$CONFIG_DIR" -o -path "$DATA_DIR" -o -path "$CACHE_DIR" \) -prune -o -type f -name "*.md" -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do get_snippet_tags "$f"; done \
+        | sort -u | grep -v '^$'
+}
+
+# -----------------------------------------------------------------------------
+# Conteúdo dos snippets
+# -----------------------------------------------------------------------------
+get_snippet_code() {
+    awk '
+        /^```/ {
+            count++
+            if (count == 1) next
+            if (count == 2) exit
+        }
+        count == 1 { print }
+    ' "$1"
+}
+
+get_snippet_preview() {
+    local file="$1"
+    local code
+    code="$(note_lib_block_content "$file" 1)"
+
+    local lines total
+    lines="$(echo "$code" | head -n "$PREVIEW_LINES" | while IFS= read -r line; do
+        echo "$line" | tr '\r' ' ' | sed 's/\t/    /g' | cut -c 1-80
+    done)"
+
+    total=$(echo "$code" | wc -l)
+    [ "$total" -gt "$PREVIEW_LINES" ] && lines="$(echo "$lines"; echo "  ... (+$((total - PREVIEW_LINES)) linhas)")"
+
+    echo "$lines"
+}
+
+# -----------------------------------------------------------------------------
+# Listagem do navegador
+#
+# Formato interno: col1_visível \t TIPO \t caminho
+#
+# col1 é o que o rofi exibe (-display-columns 1).
+# Layout da col1:
+#   pasta  →  📁 Nome                          N itens · há Xd
+#   arquivo →  Nome                             tag1, tag2 · há Xd
+#   global  →  Nome                         pasta/pai · tag1, tag2
+#
+# Tipos: UP, DIR, FILE, SEP
+# -----------------------------------------------------------------------------
+
+# Tempo relativo legível a partir de um timestamp unix (segundos)
+_rel_time() {
+    local ts="$1"
+    local now delta
+    now=$(date +%s)
+    delta=$(( now - ts ))
+
+    if   [ "$delta" -lt 3600 ];   then echo "há $(( delta / 60 ))min"
+    elif [ "$delta" -lt 86400 ];  then echo "há $(( delta / 3600 ))h"
+    elif [ "$delta" -lt 604800 ]; then echo "há $(( delta / 86400 ))d"
+    elif [ "$delta" -lt 2592000 ];then echo "há $(( delta / 604800 ))sem"
+    else                               echo "há $(( delta / 2592000 ))m"
+    fi
+}
+
+# Formata uma linha de arquivo para exibição no rofi.
+# Resultado: "nome           tags · tempo"  (coluna única, padding à direita)
+# $1=arquivo  $2=mostrar_pasta(0|1)
+_fmt_file_entry() {
+    local file="$1"
+    local show_dir="${2:-0}"
+    local name tags tag_str right ts rel
+
+    name="$(basename "$file" .md)"
+
+    # Tags (máx 3, truncadas se necessário)
+    tags="$(get_snippet_tags "$file" | head -3 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+
+    # Tempo de modificação
+    ts="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
+    rel="$(_rel_time "$ts")"
+
+    # Info direita: pasta/pai (modo global) ou tags · tempo
+    if [ "$show_dir" -eq 1 ]; then
+        local parent
+        parent="${file#$NOTES_DIR/}"
+        parent="$(dirname "$parent")"
+        [ "$parent" = "." ] && parent=""
+        [ -n "$tags" ] && right="${parent:+$parent · }${tags} · ${rel}" || right="${parent:+$parent · }${rel}"
+    else
+        [ -n "$tags" ] && right="${tags} · ${rel}" || right="$rel"
+    fi
+
+    # Padding: nome à esquerda, info à direita, total ~72 chars visíveis
+    local name_len right_len pad total=72
+    name_len="${#name}"
+    right_len="${#right}"
+    pad=$(( total - name_len - right_len ))
+    [ "$pad" -lt 2 ] && pad=2
+
+    printf "%s%*s%s" "$name" "$pad" "" "$right"
+}
+
+# Formata uma linha de pasta para exibição no rofi.
+# Resultado: "📁 Nome           N itens · há Xd"
+_fmt_dir_entry() {
+    local subdir="$1"
+    local dname count ts_recent rel right name_part
+
+    dname="$(basename "$subdir")"
+
+    # Contagem de snippets (apenas 1 nível)
+    count="$(find "$subdir" -mindepth 1 -maxdepth 1 -type f -name "*.md" 2>/dev/null | wc -l)"
+
+    # Timestamp do mais recente
+    ts_recent="$(find "$subdir" -mindepth 1 -maxdepth 1 -type f -name "*.md" \
+        -printf "%T@\n" 2>/dev/null | sort -rn | head -1 | cut -d. -f1)"
+
+    if [ -n "$ts_recent" ] && [ "$ts_recent" -gt 0 ] 2>/dev/null; then
+        rel="$(_rel_time "$ts_recent")"
+        [ "$count" -eq 1 ] && right="1 snippet · ${rel}" || right="${count} snippets · ${rel}"
+    elif [ "$count" -gt 0 ]; then
+        [ "$count" -eq 1 ] && right="1 snippet" || right="${count} snippets"
+    else
+        right="vazio"
+    fi
+
+    name_part="📁 ${dname}"
+    local name_len right_len pad total=72
+    name_len="${#name_part}"
+    right_len="${#right}"
+    pad=$(( total - name_len - right_len ))
+    [ "$pad" -lt 2 ] && pad=2
+
+    printf "%s%*s%s" "$name_part" "$pad" "" "$right"
+}
+
+list_entries() {
+    local dir="$1"
+    local sort_mode="$2"
+
+    # Voltar um nível
+    [ "$dir" != "$NOTES_DIR" ] && printf "← ..\tUP\t%s\n" "$(dirname "$dir")"
+
+    # Subpastas
+    while IFS= read -r subdir; do
+        printf "%s\tDIR\t%s\n" "$(_fmt_dir_entry "$subdir")" "$subdir"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.config' ! -name '.data' ! -name '.cache' 2>/dev/null | sort -f)
+
+    # Arquivos da pasta atual
+    if [ "$sort_mode" = "recent" ]; then
+        while IFS= read -r -d '' file; do
+            printf "%s\tFILE\t%s\n" "$(_fmt_file_entry "$file" 0)" "$file"
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -name "*.md" \
+            -printf "%T@\t%p\0" 2>/dev/null | sort -rznk1 | \
+            while IFS=$'\t' read -r -d '' _ts path; do printf "%s\0" "$path"; done)
+    else
+        while IFS= read -r -d '' file; do
+            printf "%s\tFILE\t%s\n" "$(_fmt_file_entry "$file" 0)" "$file"
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 -type f -name "*.md" -print0 \
+            2>/dev/null | sort -z)
+    fi
+
+    # Separador + todos os snippets do vault para busca integrada
+    local total
+    total=$(find "$NOTES_DIR" \( -path "$CONFIG_DIR" -o -path "$DATA_DIR" -o -path "$CACHE_DIR" \) -prune -o -type f -name "*.md" 2>/dev/null | wc -l)
+    [ "$total" -eq 0 ] && return
+
+    printf "──────────────────────────────────────────────────────────────────────────\tSEP\t\n"
+
+    find "$NOTES_DIR" \( -path "$CONFIG_DIR" -o -path "$DATA_DIR" -o -path "$CACHE_DIR" \) -prune -o -type f -name "*.md" -print0 2>/dev/null | sort -z \
+        | while IFS= read -r -d '' file; do
+            printf "%s\tFILE\t%s\n" "$(_fmt_file_entry "$file" 1)" "$file"
+        done
+}
+
+list_history() {
+    while IFS= read -r file; do
+        [ -z "$file" ] || [ ! -f "$file" ] && continue
+        printf "🕐  %s\tFILE\t%s\n" "$(_fmt_file_entry "$file" 0)" "$file"
+    done < "$HISTORY_FILE"
+}
+
+list_favorites() {
+    while IFS= read -r file; do
+        [ -z "$file" ] || [ ! -f "$file" ] && continue
+        printf "⭐  %s\tFILE\t%s\n" "$(_fmt_file_entry "$file" 0)" "$file"
+    done < "$FAVORITES_FILE"
+}
+
+# -----------------------------------------------------------------------------
+# Gerenciamento de tags de um snippet via Rofi
+#
+# Fluxo:
+#   - Mostra tags atuais do snippet com opção de remover cada uma
+#   - Opção "+ adicionar tag" abre seletor com todas as tags do vault
+#     ou permite digitar uma nova diretamente
+#   - Salva de volta no frontmatter no formato bloco (- tag)
+# -----------------------------------------------------------------------------
+manage_tags() {
+    local file="$1"
+    local name
+    name="$(basename "$file" .md)"
+
+    while true; do
+        # Tags atuais do snippet
+        local current_tags
+        current_tags="$(get_snippet_tags "$file")"
+
+        # Monta lista de opções: cada tag atual (para remover) + adicionar + voltar
+        local options=""
+        while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            options="${options}🏷 ${tag}  ✕ remover\n"
+        done <<< "$current_tags"
+        options="${options}+ adicionar tag\n🔙 Voltar"
+
+        local tag_summary=""
+        [ -n "$current_tags" ] \
+            && tag_summary="Tags: $(echo "$current_tags" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')" \
+            || tag_summary="Sem tags"
+
+        local choice
+        choice=$(printf "%b" "$options" | rofi_menu \
+            -p "🏷 $name" \
+            -mesg "$tag_summary") || return 0
+        [ -z "$choice" ] && return 0
+
+        case "$choice" in
+            "+ adicionar tag")
+                # Seletor: tags existentes no vault + campo livre para nova
+                local vault_tags new_tag
+                vault_tags="$(collect_all_tags)"
+
+                new_tag=$(printf "%b" "$vault_tags" | rofi_menu \
+                    -p "🏷 nova tag (ou digite)") || continue
+                [ -z "$new_tag" ] && continue
+
+                # Verifica se já existe
+                if echo "$current_tags" | grep -qiEx "$new_tag"; then
+                    notify-send "Trechos" "Tag \"$new_tag\" já existe."
+                    continue
+                fi
+
+                _tag_add "$file" "$new_tag"
+                notify-send "Trechos" "Tag \"$new_tag\" adicionada."
+                ;;
+
+            "🔙 Voltar"|"")
+                return 0
+                ;;
+
+            *"  ✕ remover")
+                # Extrai o nome da tag (remove prefixo emoji e sufixo)
+                local tag_to_remove
+                tag_to_remove="$(echo "$choice" | sed 's/^🏷 //' | sed 's/  ✕ remover$//')"
+                _tag_remove "$file" "$tag_to_remove"
+                notify-send "Trechos" "Tag \"$tag_to_remove\" removida."
+                ;;
+        esac
+    done
+}
+
+# Adiciona uma tag ao frontmatter (converte para formato bloco se necessário)
+_tag_add() {
+    local file="$1" tag="$2"
+
+    # Lê tags atuais e adiciona a nova
+    local tags_list
+    tags_list="$(get_snippet_tags "$file")"
+    tags_list="$(printf "%s\n%s" "$tags_list" "$tag" | grep -v '^$' | sort -u)"
+
+    _rewrite_tags "$file" "$tags_list"
+}
+
+# Remove uma tag do frontmatter
+_tag_remove() {
+    local file="$1" tag="$2"
+
+    local tags_list
+    tags_list="$(get_snippet_tags "$file" | grep -ivEx "$tag" || true)"
+
+    _rewrite_tags "$file" "$tags_list"
+}
+
+# Reescreve o bloco de tags no frontmatter do arquivo.
+# Sempre usa formato bloco (- tag) para consistência com Obsidian.
+_rewrite_tags() {
+    local file="$1" tags_list="$2"
+
+    # Monta o novo bloco de tags
+    local new_tags_block="tags:"
+    if [ -z "$tags_list" ]; then
+        new_tags_block="tags: []"
+    else
+        while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            new_tags_block="${new_tags_block}"$'\n'"  - ${t}"
+        done <<< "$tags_list"
+    fi
+
+    # Substitui o bloco tags: ... no frontmatter usando awk
+    # Opera entre os delimitadores --- e trata inline, bloco e escalar
+    awk -v new_block="$new_tags_block" '
+        BEGIN { in_front=0; in_tags=0; done=0 }
+
+        /^---[[:space:]]*$/ {
+            if (!in_front) { in_front=1; print; next }
+            else {
+                if (in_tags && !done) { print new_block; done=1 }
+                in_front=0; in_tags=0; print; next
+            }
+        }
+
+        in_front && /^tags:[[:space:]]*/ {
+            in_tags=1
+            # Inline ou escalar: substituir esta linha e não há bloco
+            if ($0 !~ /^tags:[[:space:]]*$/) {
+                print new_block
+                done=1
+                in_tags=0
+            }
+            # Bloco vazio na linha: aguarda os itens nas próximas linhas
+            next
+        }
+
+        in_front && in_tags && /^[[:space:]]+-[[:space:]]/ { next }
+
+        in_front && in_tags && /^[^[:space:]]/ {
+            if (!done) { print new_block; done=1 }
+            in_tags=0
+            print; next
+        }
+
+        { print }
+
+        END {
+            if (in_tags && !done) { print new_block }
+        }
+    ' "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
+
+# -----------------------------------------------------------------------------
+# Ações sobre um snippet
+# -----------------------------------------------------------------------------
+show_actions() {
+    local file="$1"
+    local name preview action
+
+    name="$(basename "$file" .md)"
+    preview="$(get_snippet_preview "$file")"
+
+    local fav_label
+    is_favorite "$file" && fav_label="Desfavoritar ⭐" || fav_label="Favoritar"
+
+    local block_count=0
+    block_count=$(note_lib_extract_blocks "$file" | wc -l)
+
+    local options
+    options="$(printf "Copiar\nDigitar\nEditar\nGerenciar tags\nApagar\n%s" "$fav_label")"
+
+    action=$(echo "$options" | rofi_menu \
+        -p "$name" \
+        -mesg "$preview") || return 0
+
+    case "$action" in
+        "Copiar")
+            local code block_idx
+            if (( block_count > 1 )); then
+                block_idx=$(
+                    note_lib_extract_blocks "$file" | while IFS=$'\t' read -r idx lang start end preview; do
+                        printf "bloco %s  %s  %s\n" "$idx" "${lang:-text}" "$preview"
+                    done | rofi_menu -p "bloco" -mesg "$name tem $block_count blocos"
+                ) || return 0
+                [[ -z "$block_idx" ]] && return 0
+                block_idx="${block_idx%% *}"
+                block_idx="${block_idx#bloco}"
+                code="$(note_lib_block_content "$file" "$block_idx")"
+            else
+                code="$(note_lib_block_content "$file" 1)"
+            fi
+            echo -n "$code" | copy_to_clipboard
+            add_to_history "$file"
+            notify-send "Trechos" "\"$name\" copiado."
+            return 99
+            ;;
+        "Digitar")
+            local code block_idx
+            if (( block_count > 1 )); then
+                block_idx=$(
+                    note_lib_extract_blocks "$file" | while IFS=$'\t' read -r idx lang start end preview; do
+                        printf "bloco %s  %s  %s\n" "$idx" "${lang:-text}" "$preview"
+                    done | rofi_menu -p "bloco" -mesg "$name tem $block_count blocos"
+                ) || return 0
+                [[ -z "$block_idx" ]] && return 0
+                block_idx="${block_idx%% *}"
+                block_idx="${block_idx#bloco}"
+                code="$(note_lib_block_content "$file" "$block_idx")"
+            else
+                code="$(note_lib_block_content "$file" 1)"
+            fi
+            if (( ${#code} > 5000 )); then
+                code="${code:0:5000}"
+            fi
+            add_to_history "$file"
+            sleep 0.5
+            note_lib_type_text "$code" 50
+            return 99
+            ;;
+        "Editar")
+            "$EDITOR_APP" "$file"
+            ;;
+        "Gerenciar tags")
+            manage_tags "$file"
+            ;;
+        "Apagar")
+            confirm_delete "$file"
+            ;;
+        "Favoritar"|"Desfavoritar ⭐")
+            toggle_favorite "$file"
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Criação de snippets e grupos
+# -----------------------------------------------------------------------------
+new_snippet() {
+    local current_dir="$1"
+    local name
+    name=$(rofi_menu -p "✚ +trecho") || return 0
+    [ -z "$name" ] && return 0
+
+    local clean_name file_path
+    clean_name="$(safe_filename "$name")"
+    file_path="$current_dir/${clean_name}.md"
+
+    cat > "$file_path" <<EOF
+---
+title: $name
+tags: []
+dateCreated: "[[$DATE_FORMAT]]"
+---
+
+\`\`\`
+$(read_clipboard 2>/dev/null || true)
+\`\`\`
+EOF
+
+    "$EDITOR_APP" "$file_path"
+}
+
+create_group() {
+    local current_dir="$1"
+    local name
+    name=$(rofi_menu -p "📁 +grupo") || return 0
+    [ -z "$name" ] && return 0
+
+    local clean_name
+    clean_name="$(safe_filename "$name")"
+    mkdir -p "$current_dir/$clean_name"
+    notify-send "Trechos" "Grupo: $clean_name"
+    echo "$current_dir/$clean_name"
+}
+
+confirm_delete() {
+    local file="$1"
+    local name check
+    name="$(basename "$file" .md)"
+    check=$(echo -e "Não\nSim" | rofi_menu -p "Apagar '$name'?") || return 0
+    if [ "$check" = "Sim" ]; then
+        rm "$file"
+        notify-send "Trechos" "\"$name\" apagado."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Configurações — editor visual via Rofi
+#
+# Permite alterar NOTES_DIR, EDITOR_APP, DEFAULT_SORT, HISTORY_LIMIT e
+# PREVIEW_LINES sem editar o arquivo manualmente.
+# -----------------------------------------------------------------------------
+open_settings() {
+    while true; do
+        # Lê os valores atuais (do arquivo, se existir)
+        local cur_dir cur_editor cur_sort cur_hist cur_prev
+        cur_dir="${NOTES_DIR}"
+        cur_editor="${EDITOR_APP}"
+        cur_sort="${DEFAULT_SORT}"
+        cur_hist="${HISTORY_LIMIT}"
+        cur_prev="${PREVIEW_LINES}"
+
+        local options choice
+        options="$(printf \
+            "📂 Pasta de snippets: %s\n✏️  Editor: %s\n⇅  Ordenação padrão: %s\n🕐 Limite do histórico: %s\n👁  Linhas de preview: %s\n─────────────────────────────────\n📄 Abrir config no editor\n🔙 Voltar" \
+            "$cur_dir" "$cur_editor" "$cur_sort" "$cur_hist" "$cur_prev")"
+
+        choice=$(echo "$options" | rofi_menu -p "⚙ configurações") || return 0
+
+        case "$choice" in
+            "📂 Pasta de snippets:"*)
+                local new_val
+                new_val=$(echo "$cur_dir" | rofi_menu -p "Pasta de snippets") || continue
+                [ -z "$new_val" ] && continue
+                NOTES_DIR="$new_val"
+                mkdir -p "$NOTES_DIR"
+                _save_config
+                notify-send "Trechos" "Pasta: $NOTES_DIR"
+                ;;
+            "✏️  Editor:"*)
+                local new_val
+                new_val=$(echo "$cur_editor" | rofi_menu -p "Editor") || continue
+                [ -z "$new_val" ] && continue
+                EDITOR_APP="$new_val"
+                _save_config
+                notify-send "Trechos" "Editor: $EDITOR_APP"
+                ;;
+            "⇅  Ordenação padrão:"*)
+                local new_val
+                new_val=$(printf "recent\naz" | rofi_menu -p "Ordenação") || continue
+                [ -z "$new_val" ] && continue
+                DEFAULT_SORT="$new_val"
+                _save_config
+                notify-send "Trechos" "Ordenação: $DEFAULT_SORT"
+                ;;
+            "🕐 Limite do histórico:"*)
+                local new_val
+                new_val=$(echo "$cur_hist" | rofi_menu -p "Limite do histórico (número)") || continue
+                [ -z "$new_val" ] && continue
+                HISTORY_LIMIT="$new_val"
+                _save_config
+                notify-send "Trechos" "Histórico: $HISTORY_LIMIT"
+                ;;
+            "👁  Linhas de preview:"*)
+                local new_val
+                new_val=$(echo "$cur_prev" | rofi_menu -p "Linhas de preview (número)") || continue
+                [ -z "$new_val" ] && continue
+                PREVIEW_LINES="$new_val"
+                _save_config
+                notify-send "Trechos" "Preview: $PREVIEW_LINES linhas"
+                ;;
+            "📄 Abrir config no editor")
+                "$EDITOR_APP" "$CONFIG_FILE"
+                load_config
+                ;;
+            "🔙 Voltar"|"─────────────────────────────────"|"")
+                return 0
+                ;;
+        esac
+    done
+}
+
+_save_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# snippet-holder — configuração
+NOTES_DIR="$NOTES_DIR"
+EDITOR_APP="$EDITOR_APP"
+DEFAULT_SORT="$DEFAULT_SORT"
+HISTORY_LIMIT="$HISTORY_LIMIT"
+PREVIEW_LINES="$PREVIEW_LINES"
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Busca por tag — seletor dinâmico com tags reais do vault
+# -----------------------------------------------------------------------------
+browse_by_tag() {
+    local tag
+    local all_tags
+    all_tags="$(collect_all_tags)"
+
+    if [ -z "$all_tags" ]; then
+        notify-send "Trechos" "Nenhuma tag encontrada."
+        return 0
+    fi
+
+    tag=$(echo "$all_tags" | rofi_menu -p "🏷 tag") || return 0
+    [ -z "$tag" ] && return 0
+
+    # Busca snippets com essa tag (correspondência exata de linha)
+    local results=""
+    while IFS= read -r -d '' file; do
+        if get_snippet_tags "$file" | grep -qiEx "$tag"; then
+            local name
+            name="$(basename "$file" .md)"
+            results="${results}${name}\tFILE\t${file}\n"
+        fi
+    done < <(find "$NOTES_DIR" \( -path "$CONFIG_DIR" -o -path "$DATA_DIR" -o -path "$CACHE_DIR" \) -prune -o -type f -name "*.md" -print0 2>/dev/null | sort -z)
+
+    if [ -z "$results" ]; then
+        notify-send "Trechos" "Nenhum snippet com tag: $tag"
+        return 0
+    fi
+
+    local chosen
+    chosen=$(echo -ne "$results" | rofi_menu -p "🏷 $tag") || return 0
+    [ -z "$chosen" ] && return 0
+
+    local entry_path
+    entry_path="$(echo "$chosen" | cut -f3)"
+    show_actions "$entry_path"
+}
+
+# -----------------------------------------------------------------------------
+# Trocar pasta via Rofi (Alt+w no browser)
+# -----------------------------------------------------------------------------
+_switch_folder() {
+    local current="$1"
+    local folders entries choice
+
+    entries="📁 . (raiz — 01 Snippets)"
+    folders=$(note_lib_list_snippet_folders "$NOTES_DIR")
+    if [ -n "$folders" ]; then
+        while IFS=$'\t' read -r name count; do
+            entries="$(printf '%s\n' "$entries" "📁 $name ($count snippets)")"
+        done <<< "$folders"
+    fi
+    entries="$(printf '%s\n' "$entries" "+ criar nova pasta")"
+
+    choice=$(printf '%s\n' "$entries" | rofi_menu -p "ir para pasta") || { _switch_result="$current"; return; }
+    [ -z "$choice" ] && { _switch_result="$current"; return; }
+
+    if [[ "$choice" == "+ criar nova pasta" ]]; then
+        local name clean
+        name=$(rofi_menu -p "nome da pasta") || { _switch_result="$current"; return; }
+        [ -z "$name" ] && { _switch_result="$current"; return; }
+        clean="$(safe_filename "$name")"
+        mkdir -p "$NOTES_DIR/$clean"
+        _switch_result="$NOTES_DIR/$clean"
+    elif [[ "$choice" == "📁 . (raiz — 01 Snippets)" ]]; then
+        _switch_result="$NOTES_DIR"
+    else
+        local folder_name
+        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ (.*)$//')
+        _switch_result="$NOTES_DIR/$folder_name"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Navegador de pastas (loop principal)
+# -----------------------------------------------------------------------------
+browser() {
+    local current_dir="$NOTES_DIR"
+    local sort_mode="$DEFAULT_SORT"
+
+    while true; do
+        local label msg entries selection ret dir_summary
+        label="$(short_path "$current_dir")"
+
+        dir_summary=""
+        local dir_count
+        dir_count=$(find "$current_dir" -mindepth 1 -maxdepth 1 -type f -name "*.md" 2>/dev/null | wc -l)
+        local sub_count
+        sub_count=$(find "$current_dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null | wc -l)
+        dir_summary="${dir_count} snippets"
+        (( sub_count > 0 )) && dir_summary="${dir_summary} · ${sub_count} pastas"
+
+        [ "$sort_mode" = "recent" ] \
+            && msg="✚ Alt+n · 📁 Alt+g · ⇅ Alt+o · ← Alt+q · 📂 Alt+w · ↓ recentes · ${dir_summary}" \
+            || msg="✚ Alt+n · 📁 Alt+g · ⇅ Alt+o · ← Alt+q · 📂 Alt+w · A-Z · ${dir_summary}"
+
+        entries="$(list_entries "$current_dir" "$sort_mode")"
+
+        ret=0
+        selection=$(echo "$entries" | rofi_menu \
+            -p "📂 $label" \
+            -display-columns 1 \
+            -mesg "$msg" \
+            -kb-custom-1 "Alt+n" \
+            -kb-custom-2 "Alt+g" \
+            -kb-custom-3 "Alt+o" \
+            -kb-custom-4 "Alt+q" \
+            -kb-custom-5 "Alt+w") || ret=$?
+
+        case "$ret" in
+            10) new_snippet "$current_dir" ;;
+            11)
+                local new_dir
+                new_dir="$(create_group "$current_dir")" || continue
+                [ -n "$new_dir" ] && current_dir="$new_dir"
+                ;;
+            12)
+                [ "$sort_mode" = "recent" ] && sort_mode="az" || sort_mode="recent"
+                ;;
+            13)
+                [ "$current_dir" != "$NOTES_DIR" ] && current_dir="$(dirname "$current_dir")"
+                ;;
+            14)
+                _switch_folder "$current_dir"
+                current_dir="$_switch_result"
+                unset _switch_result
+                ;;
+            0)
+                [ -z "$selection" ] && continue
+
+                local entry_type entry_path
+                entry_type="$(echo "$selection" | cut -f2)"
+                entry_path="$(echo "$selection" | cut -f3)"
+
+                case "$entry_type" in
+                    "UP")  current_dir="$entry_path" ;;
+                    "DIR") current_dir="$entry_path" ;;
+                    "SEP") continue ;;
+                    "FILE")
+                        show_actions "$entry_path"
+                        [ $? -eq 99 ] && exit 0
+                        ;;
+                esac
+                ;;
+            *) exit 0 ;;
+        esac
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Busca de blocos no vault inteiro (T7)
+# -----------------------------------------------------------------------------
+browse_vault_blocks() {
+    note_lib_ensure_dirs
+
+    if note_lib_index_stale; then
+        notify-send "Trechos" "Indexando blocos do vault..." 2>/dev/null || true
+        note_lib_build_code_index
+    fi
+
+    local query
+    query=$(rofi_menu -p "buscar bloco" -mesg "Digite para buscar blocos de código no vault") || return 0
+    [ -z "$query" ] && return 0
+
+    local results
+    results=$(note_lib_search_index "$query")
+    if [ -z "$results" ]; then
+        notify-send "Trechos" "Nenhum bloco encontrado para: $query"
+        return 0
+    fi
+
+    local entries
+    entries=$(printf '%s\n' "$results" | awk -F'\t' '{
+        file = $1; idx = $2; lang = ($3 != "" ? $3 : "text"); preview = $4
+        label = file; sub(/.*\//, "", label); sub(/\.md$/, "", label)
+        printf "%s  %s  bloco %s  %s\n", label, lang, idx, preview
+    }')
+
+    local chosen
+    chosen=$(printf '%s\n' "$entries" | rofi_menu -p "blocos") || return 0
+    [ -z "$chosen" ] && return 0
+
+    local line_num
+    line_num=$(printf '%s\n' "$entries" | grep -nFx "$chosen" | head -1 | cut -d: -f1)
+    local match
+    match=$(printf '%s\n' "$results" | sed -n "${line_num}p")
+    local file block_idx
+    file=$(printf '%s' "$match" | cut -f1)
+    block_idx=$(printf '%s' "$match" | cut -f2)
+
+    local code
+    code=$(note_lib_block_content "$NOTE_LIB_VAULT/$file" "$block_idx")
+
+    local action
+    action=$(printf '%s\n' "Copiar" "Digitar" "Salvar em pasta" "Abrir fonte" | \
+        rofi_menu -p "bloco $block_idx" -mesg "$(printf '%s' "$code" | head -15)") || return 0
+
+    case "$action" in
+        "Copiar")
+            printf '%s' "$code" | copy_to_clipboard
+            notify-send "Trechos" "Bloco copiado."
+            ;;
+        "Digitar")
+            if (( ${#code} > 5000 )); then code="${code:0:5000}"; fi
+            sleep 0.5
+            note_lib_type_text "$code" 50
+            ;;
+        "Salvar em pasta")
+            local target_dir
+            target_dir=$(_pick_target_folder) || return 0
+            [ -z "$target_dir" ] && return 0
+            mkdir -p "$target_dir"
+            note_lib_save_block "$NOTE_LIB_VAULT/$file" "$block_idx" "$target_dir"
+            notify-send "Trechos" "Bloco salvo em: $(short_path "$target_dir")"
+            ;;
+        "Abrir fonte")
+            "$EDITOR_APP" "$NOTE_LIB_VAULT/$file" 2>/dev/null || true
+            ;;
+    esac
+}
+
+_pick_target_folder() {
+    local folders
+    folders=$(note_lib_list_snippet_folders "$NOTES_DIR")
+
+    local entries
+    if [ -n "$folders" ]; then
+        entries=$(printf '%s\n' "$folders" | while IFS=$'\t' read -r name count; do
+            printf "📁 %s (%s snippets)\n" "$name" "$count"
+        done)
+    fi
+    entries="$(printf '%s\n' "$entries" "📁 . (raiz)" "+ criar nova pasta")"
+
+    local choice
+    choice=$(printf '%s\n' "$entries" | rofi_menu -p "salvar em") || return 1
+    [ -z "$choice" ] && return 1
+
+    if [[ "$choice" == "+ criar nova pasta" ]]; then
+        local name
+        name=$(rofi_menu -p "nome da pasta") || return 1
+        [ -z "$name" ] && return 1
+        local clean
+        clean="$(safe_filename "$name")"
+        printf '%s' "$NOTES_DIR/$clean"
+    elif [[ "$choice" == "📁 . (raiz)" ]]; then
+        printf '%s' "$NOTES_DIR"
+    else
+        local folder_name
+        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ (.*)$//')
+        printf '%s' "$NOTES_DIR/$folder_name"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Menu principal
+# -----------------------------------------------------------------------------
+main_menu() {
+    local options choice
+    options="$(printf "Navegar\nHistórico\nFavoritos\nBuscar por tag\nBuscar blocos (vault)\nConfigurações\nExportar\nImportar")"
+
+    choice=$(echo "$options" | rofi_menu -p "snippet-holder") || return 0
+
+    case "$choice" in
+        "Navegar")
+            browser
+            ;;
+        "Histórico")
+            local entries chosen path
+            entries="$(list_history)"
+            [ -z "$entries" ] && notify-send "Trechos" "Histórico vazio." && return 0
+            chosen=$(echo -e "$entries" | rofi_menu -p "🕐 histórico") || return 0
+            [ -z "$chosen" ] && return 0
+            path="$(echo "$chosen" | cut -f3)"
+            show_actions "$path"
+            ;;
+        "Favoritos")
+            local entries chosen path
+            entries="$(list_favorites)"
+            [ -z "$entries" ] && notify-send "Trechos" "Nenhum favorito." && return 0
+            chosen=$(echo -e "$entries" | rofi_menu -p "⭐ favoritos") || return 0
+            [ -z "$chosen" ] && return 0
+            path="$(echo "$chosen" | cut -f3)"
+            show_actions "$path"
+            ;;
+        "Buscar por tag")
+            browse_by_tag
+            ;;
+        "Buscar blocos (vault)")
+            browse_vault_blocks
+            ;;
+        "Configurações")
+            open_settings
+            ;;
+        "Exportar")
+            local dest timestamp archive
+            dest="$NOTES_DIR"
+            timestamp=$(date +%Y%m%d_%H%M%S)
+            archive="$dest/snippet-holder-export-${timestamp}.tar.gz"
+            tar -czf "$archive" -C "$(dirname "$NOTES_DIR")" "$(basename "$NOTES_DIR")" 2>/dev/null
+            notify-send "Trechos" "Exportado: $archive"
+            ;;
+        "Importar")
+            local archive
+            archive=$(rofi_menu -p "Caminho do .tar.gz") || return 0
+            [ -z "$archive" ] && return 0
+            if [ ! -f "$archive" ]; then
+                notify-send "Trechos" "Arquivo não encontrado."
+                return 0
+            fi
+            local before after
+            before=$(find "$NOTES_DIR" -type f -name "*.md" | wc -l)
+            tar -xzf "$archive" -C "$(dirname "$NOTES_DIR")" 2>/dev/null
+            after=$(find "$NOTES_DIR" -type f -name "*.md" | wc -l)
+            notify-send "Trechos" "Importados $((after - before)) snippets."
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Inicialização
+# -----------------------------------------------------------------------------
+load_config
+write_default_config
+main_menu
