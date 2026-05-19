@@ -211,7 +211,7 @@ _folder_selector() {
     printf '%s' "$snippets"
   else
     local folder_name
-    folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ (.*)$//')
+    folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ ([0-9]* snippets)$//')
     printf '%s' "$snippets/$folder_name"
   fi
 }
@@ -292,80 +292,6 @@ _block_selector() {
       --color='bg:#0d1117,bg+:#161b22,fg:#39d353,fg+:#aff5b4,hl:#58a6ff,hl+:#79c0ff,prompt:#ffa657,info:#8b949e,border:#30363d'
   )
   [[ -n "$choice" ]] && awk '{print $2}' <<< "$choice"
-}
-
-_send_to_workspace_name() {
-  local rel_path="$1"
-  source "$HOME/.local/bin/note_lib.sh"
-
-  local ws
-  ws=$(note_lib_workspace_active)
-  if [[ -z "$ws" ]]; then
-    ws=$(_workspace_selector) || return 0
-    note_lib_workspace_set "$ws"
-  fi
-
-  local block_count
-  block_count=$(note_lib_extract_blocks "$NOTES/$rel_path" | wc -l)
-  local block_idx=1
-
-  if (( block_count == 0 )); then
-    block_idx=0
-  elif (( block_count > 1 )); then
-    block_idx=$(_block_selector "$rel_path")
-    [[ -z "$block_idx" ]] && return 0
-  fi
-
-  if (( block_idx == 0 )); then
-    note_lib_workspace_add "$NOTES/$rel_path" 1 "$ws"
-  else
-    note_lib_workspace_add "$NOTES/$rel_path" "$block_idx" "$ws"
-  fi
-
-  notify-send "note_search" "✓ enviado para '$ws'" 2>/dev/null || true
-}
-
-_send_to_workspace_content() {
-  local rel_path="$1" line="$2"
-  source "$HOME/.local/bin/note_lib.sh"
-
-  local ws
-  ws=$(note_lib_workspace_active)
-  if [[ -z "$ws" ]]; then
-    ws=$(_workspace_selector) || return 0
-    note_lib_workspace_set "$ws"
-  fi
-
-  local block_idx
-  block_idx=$(note_lib_extract_blocks "$NOTES/$rel_path" \
-    | awk -v target="$line" '$3 <= target && $4 >= target { print $1; exit }')
-
-  if [[ -z "$block_idx" ]]; then
-    block_idx=0
-  fi
-
-  if (( block_idx == 0 )); then
-    note_lib_workspace_add "$NOTES/$rel_path" 1 "$ws"
-  else
-    note_lib_workspace_add "$NOTES/$rel_path" "$block_idx" "$ws"
-  fi
-
-  notify-send "note_search" "✓ enviado para '$ws'" 2>/dev/null || true
-}
-
-_send_to_workspace_block() {
-  local rel_path="$1" block_idx="${2:-1}"
-  source "$HOME/.local/bin/note_lib.sh"
-
-  local ws
-  ws=$(note_lib_workspace_active)
-  if [[ -z "$ws" ]]; then
-    ws=$(_workspace_selector) || return 0
-    note_lib_workspace_set "$ws"
-  fi
-
-  note_lib_workspace_add "$NOTES/$rel_path" "$block_idx" "$ws"
-  notify-send "note_search" "✓ enviado para '$ws'" 2>/dev/null || true
 }
 
 export -f _note_title

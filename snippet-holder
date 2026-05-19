@@ -73,16 +73,9 @@ rofi_menu() {
 # Clipboard
 # -----------------------------------------------------------------------------
 copy_to_clipboard() {
-    if command -v wl-copy >/dev/null 2>&1 && [ "$XDG_SESSION_TYPE" = "wayland" ]; then
-        wl-copy
-    elif command -v xclip >/dev/null 2>&1; then
-        xclip -selection clipboard
-    elif command -v wl-copy >/dev/null 2>&1; then
-        wl-copy
-    else
-        notify-send "Trechos" "Instale xclip ou wl-clipboard."
-        return 1
-    fi
+    local text
+    text="$(cat)"
+    note_lib_clipboard_copy "$text"
 }
 
 read_clipboard() {
@@ -129,7 +122,7 @@ is_favorite() {
 # Filesystem — helpers
 # -----------------------------------------------------------------------------
 safe_filename() {
-    echo "$1" | sed 's/[\/:*?"<>|]/-/g' | sed 's/[ ]*$//'
+    note_lib_safe_filename "$1"
 }
 
 short_path() {
@@ -201,17 +194,6 @@ collect_all_tags() {
 # -----------------------------------------------------------------------------
 # Conteúdo dos snippets
 # -----------------------------------------------------------------------------
-get_snippet_code() {
-    awk '
-        /^```/ {
-            count++
-            if (count == 1) next
-            if (count == 2) exit
-        }
-        count == 1 { print }
-    ' "$1"
-}
-
 get_snippet_preview() {
     local file="$1"
     local code
@@ -567,8 +549,7 @@ show_actions() {
                     done | rofi_menu -p "bloco" -mesg "$name tem $block_count blocos"
                 ) || return 0
                 [[ -z "$block_idx" ]] && return 0
-                block_idx="${block_idx%% *}"
-                block_idx="${block_idx#bloco}"
+                read -r _ block_idx _ <<< "$block_idx"
                 code="$(note_lib_block_content "$file" "$block_idx")"
             else
                 code="$(note_lib_block_content "$file" 1)"
@@ -587,8 +568,7 @@ show_actions() {
                     done | rofi_menu -p "bloco" -mesg "$name tem $block_count blocos"
                 ) || return 0
                 [[ -z "$block_idx" ]] && return 0
-                block_idx="${block_idx%% *}"
-                block_idx="${block_idx#bloco}"
+                read -r _ block_idx _ <<< "$block_idx"
                 code="$(note_lib_block_content "$file" "$block_idx")"
             else
                 code="$(note_lib_block_content "$file" 1)"
@@ -826,7 +806,7 @@ _switch_folder() {
         _switch_result="$NOTES_DIR"
     else
         local folder_name
-        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ (.*)$//')
+        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ ([0-9]* snippets)$//')
         _switch_result="$NOTES_DIR/$folder_name"
     fi
 }
@@ -1006,7 +986,7 @@ _pick_target_folder() {
         printf '%s' "$NOTES_DIR"
     else
         local folder_name
-        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ (.*)$//')
+        folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ ([0-9]* snippets)$//')
         printf '%s' "$NOTES_DIR/$folder_name"
     fi
 }
