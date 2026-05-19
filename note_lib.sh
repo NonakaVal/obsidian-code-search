@@ -9,6 +9,7 @@ NOTE_LIB_VAULT="${NOTE_LIB_VAULT:-${NOTES:-$HOME/Documentos/Notes}}"
 NOTE_LIB_SNIPPETS="$NOTE_LIB_VAULT/01 Snippets"
 NOTE_LIB_INDEX_FILE="$HOME/.local/share/note-workspaces/code-index.tsv"
 NOTE_LIB_INDEX_MAX_AGE=86400
+NOTE_LIB_WORKSPACE_CACHE="$HOME/.local/share/note-workspaces/workspace-cache.tsv"
 
 
 # =============================================================================
@@ -165,6 +166,133 @@ note_lib_list_snippet_folders() {
         local count
         count=$(find "$d" -maxdepth 1 -type f -name "*.md" 2>/dev/null | wc -l)
         printf '%s\t%s\n' "$name" "$count"
+    done
+}
+
+
+# =============================================================================
+# Workspace Cache & Info
+# =============================================================================
+
+# Build a TSV cache of all snippets in all workspaces.
+# Format: workspace_name<TAB>source_file<TAB>block_idx<TAB>snippet_filename
+note_lib_build_workspace_cache() {
+    local snippets_dir="$NOTE_LIB_SNIPPETS"
+    local cache_file="$NOTE_LIB_WORKSPACE_CACHE"
+    mkdir -p "$(dirname "$cache_file")"
+
+    local tmp="${cache_file}.tmp"
+
+    {
+        local ws_dir ws_name
+        for ws_dir in "$snippets_dir"/*/; do
+            [[ -d "$ws_dir" ]] || continue
+            ws_name="$(basename "$ws_dir")"
+            [[ "$ws_name" == .* ]] && continue
+
+            local md_file
+            while IFS= read -r md_file; do
+                [[ -z "$md_file" ]] && continue
+                local source block
+                source=$(_note_lib_read_field "$md_file" "source")
+                block=$(_note_lib_read_field "$md_file" "block")
+                [[ -z "$source" ]] && source="-"
+                [[ -z "$block" ]] && block="0"
+                printf '%s\t%s\t%s\t%s\n' "$ws_name" "$source" "$block" "${md_file##*/}"
+            done < <(find "$ws_dir" -name "*.md" -type f 2>/dev/null)
+        done
+    } > "$tmp"
+
+    mv "$tmp" "$cache_file"
+}
+
+# Find which workspace(s) contain a given source/block pair.
+# Args: $1 = source_file (relative path), $2 = block_idx
+# Returns: workspace names (one per line), empty if not found.
+note_lib_block_in_workspace() {
+    local source_file="$1" block_idx="$2"
+    local cache_file="$NOTE_LIB_WORKSPACE_CACHE"
+    [[ ! -f "$cache_file" ]] && return 0
+    [[ -z "$source_file" || -z "$block_idx" ]] && return 0
+    awk -F'\t' -v src="$source_file" -v blk="$block_idx" '
+        $2 == src && $3 == blk { print $1 }
+    ' "$cache_file"
+}
+
+# Count .md files in a workspace folder (recursive).
+# Args: $1 = workspace folder name (e.g., "00 Shell commands")
+note_lib_workspace_snippet_count() {
+    local ws_name="$1"
+    local ws_dir="$NOTE_LIB_SNIPPETS/$ws_name"
+    [[ ! -d "$ws_dir" ]] && { echo "0"; return; }
+    find "$ws_dir" -name "*.md" -type f 2>/dev/null | wc -l
+}
+
+# Ensure the workspace cache exists and is fresh.
+# Rebuilds if cache is missing or any workspace folder is newer than the cache.
+note_lib_ensure_workspace_cache() {
+    local cache_file="$NOTE_LIB_WORKSPACE_CACHE"
+    local snippets_dir="$NOTE_LIB_SNIPPETS"
+
+    if [[ ! -f "$cache_file" ]]; then
+        note_lib_build_workspace_cache
+        return
+    fi
+
+    local cache_ts
+    cache_ts=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+
+    local ws_dir ws_ts
+    for ws_dir in "$snippets_dir"/*/; do
+        [[ -d "$ws_dir" ]] || continue
+        ws_ts=$(stat -c %Y "$ws_dir" 2>/dev/null || echo 0)
+        if (( ws_ts > cache_ts )); then
+            note_lib_build_workspace_cache
+            return
+        fi
+    done
+}
+
+# Return info for a single workspace.
+# Args: $1 = workspace folder name
+# Format: name<TAB>count<TAB>most_recent_snippet_date
+note_lib_workspace_info() {
+    local ws_name="$1"
+    local ws_dir="$NOTE_LIB_SNIPPETS/$ws_name"
+    [[ ! -d "$ws_dir" ]] && return 1
+
+    local count
+    count=$(note_lib_workspace_snippet_count "$ws_name")
+
+    local newest_ts=0 ts
+    local md_file
+    while IFS= read -r md_file; do
+        [[ -z "$md_file" ]] && continue
+        ts=$(stat -c %Y "$md_file" 2>/dev/null || echo 0)
+        (( ts > newest_ts )) && newest_ts=$ts
+    done < <(find "$ws_dir" -name "*.md" -type f 2>/dev/null)
+
+    local date_str="-"
+    if (( newest_ts > 0 )); then
+        date_str=$(date -d "@$newest_ts" +%Y-%m-%d 2>/dev/null || echo "-")
+    fi
+
+    printf '%s\t%s\t%s\n' "$ws_name" "$count" "$date_str"
+}
+
+# List all workspaces with info.
+# Args: $1 = snippets dir (optional, defaults to $NOTE_LIB_SNIPPETS)
+# Returns: one line per workspace with name, count, and info.
+note_lib_workspace_list_with_info() {
+    local snippets_dir="${1:-$NOTE_LIB_SNIPPETS}"
+    [[ ! -d "$snippets_dir" ]] && return 0
+
+    local d name
+    for d in "$snippets_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        name="$(basename "$d")"
+        [[ "$name" == .* ]] && continue
+        note_lib_workspace_info "$name"
     done
 }
 

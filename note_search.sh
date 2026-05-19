@@ -179,14 +179,35 @@ _preview_block() {
 }
 
 _folder_selector() {
+    local check_source="${1:-}"
+    local check_block="${2:-}"
   source "$HOME/.local/bin/note_lib.sh"
   local snippets="$NOTE_LIB_SNIPPETS"
   local folders
   folders=$(note_lib_list_snippet_folders "$snippets")
 
-  local entries=""
+    # Build membership info if source/block provided
+    local membership_info=""
+    if [ -n "$check_source" ] && [ -n "$check_block" ]; then
+        note_lib_ensure_workspace_cache
+        local containing_ws
+        containing_ws=$(note_lib_block_in_workspace "$check_source" "$check_block")
+        if [ -n "$containing_ws" ]; then
+            membership_info="$containing_ws"
+        fi
+    fi
+
+    local entries=""
+    local ws_num=1
   [[ -n "$folders" ]] && while IFS=$'\t' read -r name count; do
-    entries="${entries}📁 ${name} (${count} snippets)\n"
+        local indicator=""
+        if [ -n "$membership_info" ]; then
+            if echo "$membership_info" | grep -qFx "$name"; then
+                indicator=" ✓ contains this block"
+            fi
+        fi
+        entries="${entries}${ws_num}. 📁 ${name} (${count} snippets)${indicator}\n"
+        ((ws_num++))
   done <<< "$folders"
   entries="$(printf "%b📁 . (raiz)\n+ criar nova pasta" "$entries")"
 
@@ -209,20 +230,16 @@ _folder_selector() {
     printf '%s' "$snippets/$clean"
   elif [[ "$choice" == "📁 . (raiz)" ]]; then
     printf '%s' "$snippets"
-  else
-    local folder_name
-    folder_name=$(echo "$choice" | sed 's/^📁 //' | sed 's/ ([0-9]* snippets)$//')
-    printf '%s' "$snippets/$folder_name"
+    else
+        local folder_name
+        folder_name=$(echo "$choice" | sed 's/^[0-9]*\. 📁 //' | sed 's/^📁 //' | sed 's/ ([0-9]* snippets.*$//' | sed 's/ ✓.*$//')
+        printf '%s' "$snippets/$folder_name"
   fi
 }
 
 _send_to_workspace_name() {
   local rel_path="$1"
   source "$HOME/.local/bin/note_lib.sh"
-
-  local target_dir
-  target_dir=$(_folder_selector) || return 0
-  [[ -z "$target_dir" ]] && return 0
 
   local block_count
   block_count=$(note_lib_extract_blocks "$NOTES/$rel_path" | wc -l)
@@ -234,6 +251,10 @@ _send_to_workspace_name() {
     block_idx=$(_block_selector "$rel_path")
     [[ -z "$block_idx" ]] && return 0
   fi
+
+  local target_dir
+  target_dir=$(_folder_selector "$rel_path" "$block_idx") || return 0
+  [[ -z "$target_dir" ]] && return 0
 
   if (( block_idx == 0 )); then
     note_lib_save_block "$NOTES/$rel_path" 1 "$target_dir"
@@ -248,10 +269,6 @@ _send_to_workspace_content() {
   local rel_path="$1" line="$2"
   source "$HOME/.local/bin/note_lib.sh"
 
-  local target_dir
-  target_dir=$(_folder_selector) || return 0
-  [[ -z "$target_dir" ]] && return 0
-
   local block_idx
   block_idx=$(note_lib_extract_blocks "$NOTES/$rel_path" \
     | awk -v target="$line" '$3 <= target && $4 >= target { print $1; exit }')
@@ -259,6 +276,10 @@ _send_to_workspace_content() {
   if [[ -z "$block_idx" ]]; then
     block_idx=1
   fi
+
+  local target_dir
+  target_dir=$(_folder_selector "$rel_path" "$block_idx") || return 0
+  [[ -z "$target_dir" ]] && return 0
 
   note_lib_save_block "$NOTES/$rel_path" "$block_idx" "$target_dir"
   notify-send "note_search" "✓ salvo em '$(basename "$target_dir")/'" 2>/dev/null || true
@@ -269,7 +290,7 @@ _send_to_workspace_block() {
   source "$HOME/.local/bin/note_lib.sh"
 
   local target_dir
-  target_dir=$(_folder_selector) || return 0
+  target_dir=$(_folder_selector "$rel_path" "$block_idx") || return 0
   [[ -z "$target_dir" ]] && return 0
 
   note_lib_save_block "$NOTES/$rel_path" "$block_idx" "$target_dir"

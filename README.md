@@ -20,8 +20,9 @@ Three scripts that work together:
 - **Code block index**: pre-indexes all code blocks for instant search (~0.2s for 2800+ blocks)
 - **Rich preview**: syntax-highlighted markdown via glow, line numbers, search term highlighting
 - **Save to workspace**: `ctrl-y` saves any code block to a chosen subfolder inside `01 Snippets/`
+- **Membership indicator**: Folder selector shows `✓ contains this block` for workspaces that already have the selected block
 - **Multi-block files**: if a file has N code blocks, a sub-selector lets you pick which one
-- **Folder selector**: pick from existing subfolders (with snippet counts) or create a new one
+- **Folder selector**: pick from existing subfolders (with snippet counts and membership info) or create a new one
 - **Keybinds**: `ctrl-r` reload, `ctrl-e` edit, `ctrl-o` toggle sort, `ctrl-y` save to folder
 
 ### snippet-holder — GUI Snippet Manager (Rofi)
@@ -189,6 +190,7 @@ snippet-holder
 
 | Option | Description |
 |---|---|
+| 📂 1. Workspace Name (N snippets) | Direct access to workspace (dynamic, Alt+1-9) |
 | Navegar | File browser for `01 Snippets/` |
 | Historico | Recently used snippets |
 | Favoritos | Starred snippets |
@@ -198,6 +200,8 @@ snippet-holder
 | Exportar | Backup as tar.gz |
 | Importar | Restore from tar.gz |
 
+Workspace entries appear dynamically at the top of the menu with snippet counts. Selecting one opens the browser directly at that workspace.
+
 **Browser keybinds (Rofi):**
 
 | Key | Action |
@@ -206,7 +210,8 @@ snippet-holder
 | `Alt+g` | New folder/group |
 | `Alt+o` | Toggle sort (recent / A-Z) |
 | `Alt+q` | Go up one level |
-| `Alt+w` | Switch to any subfolder |
+| `Alt+w` | Switch to any subfolder (shows snippet counts) |
+| `Alt+1`–`Alt+9` | Jump directly to workspace 1–9 |
 
 **Block actions (vault search):**
 
@@ -216,6 +221,8 @@ snippet-holder
 | Digitar | Type code into active app (xdotool, 500ms delay) |
 | Salvar em pasta | Save as .md in chosen subfolder |
 | Abrir fonte | Open source note in editor |
+
+Blocks already saved to a workspace show a `✓ workspace-name` badge in search results.
 
 ---
 
@@ -237,6 +244,7 @@ snippet-holder
           │ • Save block    │
           │ • Clipboard     │
           │ • xdotool type  │
+          │ • Ws cache/info │
           └───┬─────────┬───┘
               │         │
    ┌──────────▼──┐  ┌───▼──────────┐
@@ -254,8 +262,20 @@ snippet-holder
                    │ (workspaces) │
                    │  └ folder A  │
                    │  └ folder B  │
-                   └──────────────┘
+                   └──────┬──────┘
+                          │
+                   ┌──────▼──────┐
+                   │ Ws Cache    │
+                   │ (TSV index) │
+                   └─────────────┘
 ```
+
+### Data Files
+
+| File | Location | Purpose |
+|---|---|---|
+| Code index | `~/.local/share/note-workspaces/code-index.tsv` | All code blocks in vault (excl. Snippets) |
+| Workspace cache | `~/.local/share/note-workspaces/workspace-cache.tsv` | Maps blocks to their workspace membership |
 
 ### Saved Snippet Format
 
@@ -275,6 +295,19 @@ def example():
     pass
 \`\`\`
 ```
+
+---
+
+## Vault Conventions
+
+The vault follows naming and organization conventions documented in [`docs/vault-conventions.md`](docs/vault-conventions.md). This reference covers:
+
+- **Folder naming**: Numbered prefixes (01, 03, 04...) for sort order, PARA-like structure
+- **File naming**: Prefix conventions (`py-` for Python, `hub-` for index notes, `flow-` for workflows)
+- **Code blocks**: Language annotation conventions for search optimization
+- **Tags**: Recommended hierarchical tag vocabulary
+- **Workspaces**: How `01 Snippets/` subfolders work as code block workspaces
+- **Search tips**: How naming choices affect `rg` and `fzf` search quality
 
 ---
 
